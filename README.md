@@ -10,6 +10,7 @@
 > expands that sketch into an implementable specification with an honest security
 > analysis.
 
+> © Hairetikos (Natoshi Sakamoto) @github 2026
 ---
 
 ## Motivation & goal — toward a single-thread-bound, "fair-luck" PoW
