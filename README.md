@@ -10,8 +10,118 @@
 > expands that sketch into an implementable specification with an honest security
 > analysis.
 
-> © Hairetikos @github 2026
+---
 
+## Motivation & goal — toward a single-thread-bound, "fair-luck" PoW
+
+ORDO is designed to be **ASIC- and GPU-resistant** *and* **hard to parallelize
+across threads/cores**, so that mining-lottery luck is distributed as evenly as
+possible across different CPUs — rewarding the metric on which modern CPUs are
+most *alike*, not the one on which specialized hardware runs away.
+
+**The wager: single-thread performance has stagnated.** Clock speeds plateaued in
+the mid-2000s with the end of Dennard scaling; since then we have gained *cores*,
+SIMD width, and accelerators — not *GHz*. A high-end server core is not
+dramatically faster, *per dependent instruction*, than a modest desktop core; they
+are all, roughly, mediocre at one long serial chain of work. A PoW **bound by
+single-thread speed** therefore levels the field: it cannot be won by piling on
+cores, GPU lanes, or ASIC pipelines — only by the one quantity that has barely
+moved in twenty years and is similar across machines.
+
+Put aspirationally: **we want to see 10 GHz CPUs.** Until the industry delivers
+single-thread speed again, a single-thread-bound PoW keeps the mining reward
+pointed at the metric we wish vendors would optimize, instead of subsidizing
+warehouses of parallel silicon.
+
+**The honest tension (read §2 and §12, do not skip).** "Single-threaded by design"
+and "fair lottery" pull against each other:
+
+- A *truly* serial-by-design workload is **ORDO-VDF** (no grinding, §12): one
+  forced-serial chain everyone must walk. It defeats multithreading by
+  construction — but it has **no lottery**: the chain is deterministic, so the
+  fastest single-thread stepper wins *every* block → centralization.
+- A *lottery* needs **grinding** (independent nonce attempts, §9), which restores
+  fair variance — but grinding is embarrassingly parallel across nonces, so
+  multicore/GPU *does* help, and you only *approximate* single-threadedness by
+  **saturating a shared resource** (memory bandwidth/capacity) so extra cores stop
+  paying off (§10.2).
+
+ORDO's stance: ship **grinding ORDO** for a real lottery, and lean on the borrowed
+memory subsystem to *flatten* multicore scaling so that, in practice, throughput
+tracks single-thread speed far more than core count. Whether that flattening is
+actually achievable is an empirical question — it is exactly what the Stage-0 PoC
+(§14) is built to measure *before* we commit to the design.
+
+---
+
+## Inspiration — workloads that are serial *by design*
+
+The design draws on real systems whose core step resists parallelization. They
+share one shape: a **left-fold with a non-associative combiner**,
+
+> `sₙ = f(sₙ₋₁, xₙ)` — where the state `s` is large and `f` is non-associative and
+> non-invertible.
+
+The standard way to parallelize a fold is the **parallel prefix-scan**, which
+*requires the combiner to be associative* (so subranges can be combined in any
+order). Strip associativity away and no scan exists: the fold's critical path is
+the **entire input**, and it is serial by construction. **ORDO's backbone (§5) is
+deliberately such a fold** — each step's primary input is the previous step's
+output, mixed by a non-associative word-gate. The examples below are the existence
+proofs that this pattern is real, ubiquitous, and stubbornly single-threaded.
+
+### clang/LLVM full (monolithic) LTO — the final link stage
+With `-flto` (full LTO) each translation unit is compiled to **LLVM bitcode**, not
+native objects. At link time the LTO plugin **merges all bitcode into one
+monolithic module** and runs **whole-program interprocedural optimization**
+(cross-module inlining, global DCE, IPSCCP, whole-program devirtualization) then
+codegen on that single module. The IPO stage is **inherently serial**: the
+optimizations are **order-dependent and mutate one shared IR graph** — inlining A
+into B changes B, which changes whether B should be inlined into C, which changes
+the call graph the next decision reads. The analyses need *global visibility of a
+single mutable module*, so they run on one thread and scale with the whole program
+(the classic "LTO link pegs one core for minutes and eats all the RAM").
+
+The proof that *this* is the bottleneck: **ThinLTO** was invented to remove it. It
+keeps modules separate, performs only a tiny **serial "thin-link"** over compact
+per-module **summaries** + a function index, then does the heavy
+optimization/import **per-module in parallel backends** — confining the serial
+work to a small summary merge. Full LTO trades that parallelism away for maximal
+whole-program visibility; that trade *is* the single-threaded final link.
+
+### Bitcoin Core IBD — connecting the chain (researched in `validation.cpp`)
+Initial Block Download has a cleanly split personality:
+- **Parallel:** block *download* (many peers) and **script/signature verification**
+  via `CCheckQueue` (`-par=N` worker threads). `-assumevalid` even *skips*
+  signature checks for historical blocks, so the parallelizable work is largely
+  elided during a modern sync.
+- **Serial by design:** **connecting each block to the UTXO set.** The path is
+  `ActivateBestChain` → `ActivateBestChainStep` → `ConnectTip` → `ConnectBlock`,
+  one block at a time; `ConnectBlock` applies every transaction to the
+  `CCoinsViewCache` via `UpdateCoins` (`SpendCoin` inputs, `AddCoin` outputs).
+  Block *N+1*'s inputs must be validated against the **exact** UTXO set left by
+  block *N* (to prove referenced outputs exist and are unspent), so the UTXO set is
+  a single evolving state folded over the chain in order:
+  `utxo_n = apply(utxo_{n-1}, block_n)`. You cannot connect *N+1* before *N*. Even
+  with scripts skipped and blocks pre-fetched, IBD stays bottlenecked on this
+  serial fold (+ its DB/cache work) — which is why it does not keep speeding up
+  with more cores.
+
+### More instances of the same pattern
+- **VDFs / repeated squaring** (`y = x^(2^t) mod N`) — the canonical sequential
+  function; the basis of ORDO-VDF (§12).
+- **Hash chains / iterated hashing** (`H(H(H(…)))`) — each step needs the last.
+- **CBC-mode encryption** — `cₙ = E(cₙ₋₁ ⊕ pₙ)`; encryption is serial (decryption
+  and CTR mode are parallel — the contrast is instructive: the *chaining* is what
+  forbids parallelism).
+- **RNN recurrence** — `hₜ = f(hₜ₋₁, xₜ)`; the exact serialism Transformers
+  abandoned to parallelize training. A modern, vivid example of the trade.
+- **Single-stream DEFLATE/gzip decompression** — back-references read previously
+  emitted output, so one stream decompresses serially.
+- **Gauss–Seidel / SOR relaxation** — each update consumes the just-updated
+  neighbor (see RELAX in [`proposals.md`](./proposals.md) §3b).
+- **P-complete problems** — the formal home of "inherently sequential" (§3): not
+  in NC unless NC = P. ORDO's theoretical backstop.
 
 ---
 
