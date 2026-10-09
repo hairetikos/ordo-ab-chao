@@ -1,3 +1,9 @@
+note:  the local working repository for this project has changed significantly and this page will be updated in due time
+
+the ORDO specification below was tested besides other variants, and another variant was proven much better at realising the intented goal.
+
+ORDO is left here as an initial research/conceptual relic
+
 # ORDO — Technical Specification (v0.1, draft)
 
 > **ORDO** — *Ordered Reduction / Depth-Obliged* proof-of-work. A PoW whose
